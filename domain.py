@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
 
+from config import DEFAULT_CONFIG
+
 
 class MerchantType(str, Enum):
     COMPANY_CT = "COMPANY_CT"
@@ -18,21 +20,9 @@ class MerchantType(str, Enum):
     OTHER = "OTHER"
 
 
-GENERIC_TOKENS = {
-    "CH", "CUA", "HANG", "TIEM",
-    "SHOP", "STORE", "MART", "POS",
-    "QUAN", "AN"
-}
-
-SUFFIX_CANDIDATES = {
-    "BTL", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9",
-    "Q10", "Q11", "Q12", "GO", "VAP", "GV", "OCP"
-}
-
-DOMAIN_PREFIX_SEQUENCES = [
-    ["VAN", "TAI"],
-    ["TAP", "HOA"],
-]
+GENERIC_TOKENS = set(DEFAULT_CONFIG["generic_tokens"])
+SUFFIX_CANDIDATES = set(DEFAULT_CONFIG["suffix_candidates"])
+DOMAIN_PREFIX_SEQUENCES = [list(seq) for seq in DEFAULT_CONFIG["domain_prefix_sequences"]]
 
 
 @dataclass

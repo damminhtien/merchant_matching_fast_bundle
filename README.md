@@ -21,6 +21,7 @@ python merchant_matching_fast.py \
 - `alpha`: weight between Jaccard and Levenshtein.
 - `high_thr`, `low_thr`: thresholds for MATCH/REVIEW/NON_MATCH.
 - `engine`: dataframe engine; Polars path also computes similarity/classification inside Polars with RapidFuzz Levenshtein to avoid Python row loops.
+- Default thresholds come from `config.py` (`high_thr`, `low_thr`, `alpha`); override via CLI flags.
 
 ## How it works
 
@@ -37,6 +38,7 @@ python merchant_matching_fast.py \
 ## Project structure
 
 - `domain.py`: `MerchantType`, constants, and the `TypeRule` config table (add a rule to extend).
+- `config.py`: default tokens/prefixes and similarity thresholds + version metadata.
 - `parsing.py`: normalization, tokenization, type detection via rules, prefix stripping, core/suffix/location extraction.
 - `blocking.py`: block-key generation and pandas/Polars blocking + candidate building.
 - `similarity.py`: Jaccard + RapidFuzz Levenshtein, pandas similarity/classification, Polars similarity/classification.
@@ -48,6 +50,7 @@ python merchant_matching_fast.py \
 - Polars engine removes Python loops for blocking and similarity/classification; pandas keeps a Python loop for similarity but uses RapidFuzz (C-level) for Levenshtein.
 - Avoid `DataFrame.apply`; classification is vectorized (pandas) or expression-based (Polars).
 - Add more merchant types by appending to `TYPE_RULES` in `domain.py`.
+- Output CSV now includes metadata columns: `engine`, `alpha`, `high_thr`, `low_thr`, `timestamp`, `version`.
 
 ## Testing
 

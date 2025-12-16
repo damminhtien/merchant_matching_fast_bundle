@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 
 from blocking import (
     build_candidate_pairs,
     prepare_blocking_dataframe,
     prepare_candidates_polars,
 )
+from config import DEFAULT_CONFIG, VERSION
 from similarity import (
     classify_matches,
     compute_similarity_and_classify_polars,
@@ -33,6 +35,16 @@ def core_pipeline_pandas(
     candidates = build_candidate_pairs(df_b1, df_b2)
     candidates = compute_similarity_df(candidates, alpha=alpha)
     candidates = classify_matches(candidates, high_thr=high_thr, low_thr=low_thr)
+
+    meta_ts = datetime.utcnow().isoformat()
+    candidates = candidates.assign(
+        engine="pandas",
+        alpha=alpha,
+        high_thr=high_thr,
+        low_thr=low_thr,
+        timestamp=meta_ts,
+        version=VERSION,
+    )
 
     candidates.sort_values("sim_final", ascending=False, inplace=True)
     candidates.to_csv(output_path, index=False)
@@ -73,6 +85,12 @@ def core_pipeline_polars(
         [
             pl.col("sim_tokens_1").list.join(" ").alias("sim_tokens_1"),
             pl.col("sim_tokens_2").list.join(" ").alias("sim_tokens_2"),
+            pl.lit("polars").alias("engine"),
+            pl.lit(alpha).alias("alpha"),
+            pl.lit(high_thr).alias("high_thr"),
+            pl.lit(low_thr).alias("low_thr"),
+            pl.lit(datetime.utcnow().isoformat()).alias("timestamp"),
+            pl.lit(VERSION).alias("version"),
         ]
     )
     candidates_pl = candidates_pl.sort("sim_final", descending=True)
@@ -94,9 +112,9 @@ def run_matching(
     col_name_1: str = "Merchant_Name_1",
     col_name_2: str = "Merchant_Name_2",
     output_path: str = "merchant_matching_results_fast.csv",
-    high_thr: float = 0.75,
-    low_thr: float = 0.4,
-    alpha: float = 0.5,
+    high_thr: float = DEFAULT_CONFIG["thresholds"]["high_thr"],
+    low_thr: float = DEFAULT_CONFIG["thresholds"]["low_thr"],
+    alpha: float = DEFAULT_CONFIG["thresholds"]["alpha"],
     engine: str = "pandas",
 ) -> None:
     engine = engine.lower()
@@ -141,9 +159,9 @@ def main() -> None:
     parser.add_argument("--col1", default="Merchant_Name_1", help="Column name for first merchant list.")
     parser.add_argument("--col2", default="Merchant_Name_2", help="Column name for second merchant list.")
     parser.add_argument("--output", default="merchant_matching_results_fast.csv", help="Output CSV path.")
-    parser.add_argument("--high_thr", type=float, default=0.75, help="High threshold for MATCH.")
-    parser.add_argument("--low_thr", type=float, default=0.4, help="Low threshold for REVIEW.")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for Jaccard vs Levenshtein.")
+    parser.add_argument("--high_thr", type=float, default=DEFAULT_CONFIG["thresholds"]["high_thr"], help="High threshold for MATCH.")
+    parser.add_argument("--low_thr", type=float, default=DEFAULT_CONFIG["thresholds"]["low_thr"], help="Low threshold for REVIEW.")
+    parser.add_argument("--alpha", type=float, default=DEFAULT_CONFIG["thresholds"]["alpha"], help="Weight for Jaccard vs Levenshtein.")
     parser.add_argument(
         "--engine",
         choices=["pandas", "polars"],
