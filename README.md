@@ -5,7 +5,7 @@
 ## Quickstart
 
 ```bash
-pip install -r requirements_fast.txt
+pip install -r requirements.txt
 
 python merchant_matching_fast.py \
   --input merchant_names_randomized.csv \
@@ -48,3 +48,11 @@ python merchant_matching_fast.py \
 - Polars engine removes Python loops for blocking and similarity/classification; pandas keeps a Python loop for similarity but uses RapidFuzz (C-level) for Levenshtein.
 - Avoid `DataFrame.apply`; classification is vectorized (pandas) or expression-based (Polars).
 - Add more merchant types by appending to `TYPE_RULES` in `domain.py`.
+
+## Testing
+
+```bash
+pytest
+```
+
+Unit tests focus on parsing primitives (normalization, type detection, prefix stripping, suffix/location extraction, similarity tokens) with table-driven cases.
