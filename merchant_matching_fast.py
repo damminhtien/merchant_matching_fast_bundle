@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, List
 
 import numpy as np
 import pandas as pd
+from rapidfuzz.distance import Levenshtein as rf_lev
 
 
 class MerchantType(str, Enum):
@@ -45,6 +46,79 @@ class ParsedMerchant:
     location_key: str
 
 
+@dataclass
+class TypeRule:
+    name: MerchantType
+    detect_sequences: List[List[str]] = field(default_factory=list)
+    detect_tokens_any: List[str] = field(default_factory=list)
+    strip_prefix_sequences: List[List[str]] = field(default_factory=list)
+    strip_prefix_tokens_any: List[str] = field(default_factory=list)
+    strip_after_tokens_any: List[str] = field(default_factory=list)
+
+
+DOMAIN_PREFIX_SEQUENCES = [
+    ["VAN", "TAI"],
+    ["TAP", "HOA"],
+]
+
+TYPE_RULES: List[TypeRule] = [
+    TypeRule(
+        name=MerchantType.HOUSEHOLD_HKD,
+        detect_sequences=[["HO", "KINH", "DOANH"]],
+        detect_tokens_any=["HKD"],
+        strip_prefix_sequences=[["HO", "KINH", "DOANH"]],
+        strip_prefix_tokens_any=["HKD"],
+    ),
+    TypeRule(
+        name=MerchantType.PHARMACY,
+        detect_sequences=[["NHA", "THUOC"]],
+        strip_prefix_sequences=[["NHA", "THUOC"]],
+    ),
+    TypeRule(
+        name=MerchantType.RESTAURANT_QUAN,
+        detect_sequences=[["QUAN", "AN"], ["NHA", "HANG"]],
+        strip_prefix_sequences=[["QUAN", "AN"], ["NHA", "HANG"]],
+    ),
+    TypeRule(
+        name=MerchantType.HAIR_SALON,
+        detect_sequences=[["SALON", "TOC"], ["TIEM", "TOC"]],
+        strip_prefix_sequences=[["SALON", "TOC"], ["TIEM", "TOC"]],
+    ),
+    TypeRule(
+        name=MerchantType.GAS,
+        detect_tokens_any=["GAS"],
+        strip_prefix_tokens_any=["GAS"],
+    ),
+    TypeRule(
+        name=MerchantType.CAFE,
+        detect_tokens_any=["CAFE", "COFFEE"],
+        strip_after_tokens_any=["CAFE", "COFFEE"],
+    ),
+    TypeRule(
+        name=MerchantType.SHOP,
+        detect_sequences=[["TAP", "HOA"], ["CUA", "HANG"]],
+        detect_tokens_any=["SHOP", "STORE", "MART"],
+        strip_prefix_sequences=[["TAP", "HOA"], ["CUA", "HANG"]],
+        strip_prefix_tokens_any=["CH", "TIEM"],
+    ),
+    TypeRule(
+        name=MerchantType.OFFICE_VP,
+        detect_tokens_any=["VP"],
+        detect_sequences=[["VAN", "PHONG"]],
+        strip_prefix_tokens_any=["VP"],
+        strip_prefix_sequences=[["VAN", "PHONG"]],
+    ),
+    TypeRule(
+        name=MerchantType.COMPANY_CT,
+        detect_tokens_any=["CT", "CTY", "TNHH"],
+        detect_sequences=[["CONG", "TY"]],
+        strip_prefix_tokens_any=["CT", "CTY", "CONG", "TY", "TNHH"],
+    ),
+]
+
+TYPE_RULE_MAP = {rule.name: rule for rule in TYPE_RULES}
+
+
 def normalize_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
@@ -75,118 +149,43 @@ def detect_type(tokens: List[str]) -> MerchantType:
     if not tokens:
         return MerchantType.OTHER
 
-    if "HKD" in tokens or _has_sequence(tokens, ["HO", "KINH", "DOANH"]):
-        return MerchantType.HOUSEHOLD_HKD
-
-    if _has_sequence(tokens, ["NHA", "THUOC"]):
-        return MerchantType.PHARMACY
-
-    if _has_sequence(tokens, ["QUAN", "AN"]) or _has_sequence(tokens, ["NHA", "HANG"]):
-        return MerchantType.RESTAURANT_QUAN
-
-    if ("SALON" in tokens and "TOC" in tokens) or _has_sequence(tokens, ["TIEM", "TOC"]):
-        return MerchantType.HAIR_SALON
-
-    if "GAS" in tokens:
-        return MerchantType.GAS
-
-    if "CAFE" in tokens or "COFFEE" in tokens:
-        return MerchantType.CAFE
-
-    if _has_sequence(tokens, ["TAP", "HOA"]):
-        return MerchantType.SHOP
-
-    if (("CUA" in tokens and "HANG" in tokens)
-        or "SHOP" in tokens
-        or "STORE" in tokens
-        or "MART" in tokens):
-        return MerchantType.SHOP
-
-    if "VP" in tokens or _has_sequence(tokens, ["VAN", "PHONG"]):
-        return MerchantType.OFFICE_VP
-
-    if ("CT" in tokens
-        or "CTY" in tokens
-        or ("CONG" in tokens and "TY" in tokens)
-        or "TNHH" in tokens):
-        return MerchantType.COMPANY_CT
-
+    for rule in TYPE_RULES:
+        if any(_has_sequence(tokens, seq) for seq in rule.detect_sequences):
+            return rule.name
+        if any(tok in tokens for tok in rule.detect_tokens_any):
+            return rule.name
     return MerchantType.OTHER
 
 
 def _strip_type_prefix(tokens: List[str], mtype: MerchantType) -> List[str]:
     t = tokens[:]
 
-    def strip_sequence(seq: List[str]) -> List[str]:
-        nonlocal t
-        if _has_sequence(t, seq):
-            n, m = len(t), len(seq)
+    def strip_sequence(current: List[str], seq: List[str]) -> List[str]:
+        if _has_sequence(current, seq):
+            n, m = len(current), len(seq)
             for i in range(n - m + 1):
-                if t[i:i + m] == seq:
-                    t = t[i + m:]
-                    break
+                if current[i:i + m] == seq:
+                    return current[i + m:]
+        return current
+
+    for seq in DOMAIN_PREFIX_SEQUENCES:
+        t = strip_sequence(t, seq)
+
+    rule = TYPE_RULE_MAP.get(mtype)
+    if not rule:
         return t
 
-    # Domain prefixes
-    if _has_sequence(t, ["VAN", "TAI"]):
-        t = strip_sequence(["VAN", "TAI"])
-    if _has_sequence(t, ["TAP", "HOA"]):
-        t = strip_sequence(["TAP", "HOA"])
+    for seq in rule.strip_prefix_sequences:
+        t = strip_sequence(t, seq)
 
-    if mtype == MerchantType.HOUSEHOLD_HKD:
-        if "HKD" in t:
-            idx = t.index("HKD")
-            return t[idx + 1:]
-        return strip_sequence(["HO", "KINH", "DOANH"])
+    while t and t[0] in set(rule.strip_prefix_tokens_any):
+        t = t[1:]
 
-    if mtype == MerchantType.PHARMACY:
-        return strip_sequence(["NHA", "THUOC"])
-
-    if mtype == MerchantType.RESTAURANT_QUAN:
-        if _has_sequence(t, ["QUAN", "AN"]):
-            return strip_sequence(["QUAN", "AN"])
-        return strip_sequence(["NHA", "HANG"])
-
-    if mtype == MerchantType.HAIR_SALON:
-        if _has_sequence(t, ["SALON", "TOC"]):
-            return strip_sequence(["SALON", "TOC"])
-        return strip_sequence(["TIEM", "TOC"])
-
-    if mtype == MerchantType.GAS:
-        if t and t[0] == "GAS":
-            return t[1:]
-        return t
-
-    if mtype == MerchantType.CAFE:
-        if "CAFE" in t:
-            idx = t.index("CAFE")
-            return t[idx + 1:]
-        if "COFFEE" in t:
-            idx = t.index("COFFEE")
-            return t[idx + 1:]
-        return t
-
-    if mtype == MerchantType.SHOP:
-        if _has_sequence(t, ["CUA", "HANG"]):
-            return strip_sequence(["CUA", "HANG"])
-        if t and t[0] == "CH":
-            return t[1:]
-        if t and t[0] == "TIEM":
-            return t[1:]
-        return t
-
-    if mtype == MerchantType.OFFICE_VP:
-        if t and t[0] == "VP":
-            return t[1:]
-        if _has_sequence(t, ["VAN", "PHONG"]):
-            return strip_sequence(["VAN", "PHONG"])
-        return t
-
-    if mtype == MerchantType.COMPANY_CT:
-        i = 0
-        while i < len(t) and t[i] in {"CT", "CTY", "CONG", "TY", "TNHH"}:
-            i += 1
-        return t[i:]
+    for tok in rule.strip_after_tokens_any:
+        if tok in t:
+            idx = t.index(tok)
+            t = t[idx + 1:]
+            break
 
     return t
 
@@ -343,40 +342,11 @@ def jaccard_similarity(tokens1: List[str], tokens2: List[str]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def levenshtein_distance(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    la, lb = len(a), len(b)
-    if la == 0:
-        return lb
-    if lb == 0:
-        return la
-    prev = list(range(lb + 1))
-    curr = [0] * (lb + 1)
-    for i in range(1, la + 1):
-        curr[0] = i
-        ca = a[i - 1]
-        for j in range(1, lb + 1):
-            cb = b[j - 1]
-            cost = 0 if ca == cb else 1
-            x = prev[j] + 1
-            y = curr[j - 1] + 1
-            z = prev[j - 1] + cost
-            if y < x:
-                x = y
-            if z < x:
-                x = z
-            curr[j] = x
-        prev, curr = curr, prev
-    return prev[lb]
-
-
 def levenshtein_similarity(a: str, b: str) -> float:
     if not a and not b:
         return 1.0
-    dist = levenshtein_distance(a, b)
-    max_len = max(len(a), len(b))
-    return 1.0 - dist / max_len
+    # rapidfuzz returns 0-100 normalized score; scale to 0-1
+    return rf_lev.normalized_similarity(a, b) / 100.0
 
 
 def compute_similarity_df(candidates: pd.DataFrame, alpha: float = 0.5) -> pd.DataFrame:
@@ -432,13 +402,6 @@ def compute_similarity_and_classify_polars(
     pl: Any,
 ) -> Any:
     """Compute similarities + labels with Polars set ops + RapidFuzz Levenshtein."""
-    try:
-        from rapidfuzz.distance import Levenshtein as rf_lev
-    except ImportError as exc:
-        raise ImportError(
-            "Polars engine needs rapidfuzz for Levenshtein. Please install rapidfuzz."
-        ) from exc
-
     base = candidates.with_columns(
         [
             pl.col("sim_tokens_1").list.join(" ").alias("sim_name_1"),
@@ -479,6 +442,79 @@ def compute_similarity_and_classify_polars(
     )
 
 
+def core_pipeline_pandas(
+    input_path: str,
+    col_name_1: str,
+    col_name_2: str,
+    output_path: str,
+    high_thr: float,
+    low_thr: float,
+    alpha: float,
+) -> dict:
+    df = pd.read_csv(input_path)
+    df_b1 = prepare_blocking_dataframe(df, col_name_1, "col1")
+    df_b2 = prepare_blocking_dataframe(df, col_name_2, "col2")
+    num_b1, num_b2 = len(df_b1), len(df_b2)
+
+    candidates = build_candidate_pairs(df_b1, df_b2)
+    candidates = compute_similarity_df(candidates, alpha=alpha)
+    candidates = classify_matches(candidates, high_thr=high_thr, low_thr=low_thr)
+
+    candidates.sort_values("sim_final", ascending=False, inplace=True)
+    candidates.to_csv(output_path, index=False)
+
+    return {
+        "num_b1": num_b1,
+        "num_b2": num_b2,
+        "num_candidates": len(candidates),
+        "num_block_keys": candidates["block_key"].nunique(),
+        "num_match": (candidates["match_label"] == "MATCH").sum(),
+        "num_review": (candidates["match_label"] == "REVIEW").sum(),
+        "num_non_match": (candidates["match_label"] == "NON_MATCH").sum(),
+    }
+
+
+def core_pipeline_polars(
+    input_path: str,
+    col_name_1: str,
+    col_name_2: str,
+    output_path: str,
+    high_thr: float,
+    low_thr: float,
+    alpha: float,
+) -> dict:
+    candidates_pl, num_b1, num_b2, pl = prepare_candidates_polars(
+        input_path=input_path,
+        col_name_1=col_name_1,
+        col_name_2=col_name_2,
+    )
+    candidates_pl = compute_similarity_and_classify_polars(
+        candidates_pl,
+        alpha=alpha,
+        high_thr=high_thr,
+        low_thr=low_thr,
+        pl=pl,
+    )
+    candidates_pl = candidates_pl.with_columns(
+        [
+            pl.col("sim_tokens_1").list.join(" ").alias("sim_tokens_1"),
+            pl.col("sim_tokens_2").list.join(" ").alias("sim_tokens_2"),
+        ]
+    )
+    candidates_pl = candidates_pl.sort("sim_final", descending=True)
+    candidates_pl.write_csv(output_path)
+
+    return {
+        "num_b1": num_b1,
+        "num_b2": num_b2,
+        "num_candidates": len(candidates_pl),
+        "num_block_keys": candidates_pl.select(pl.col("block_key").n_unique()).item(),
+        "num_match": (candidates_pl["match_label"] == "MATCH").sum(),
+        "num_review": (candidates_pl["match_label"] == "REVIEW").sum(),
+        "num_non_match": (candidates_pl["match_label"] == "NON_MATCH").sum(),
+    }
+
+
 def prepare_candidates_polars(
     input_path: str,
     col_name_1: str,
@@ -514,59 +550,34 @@ def run_matching(
         raise ValueError("engine must be 'pandas' or 'polars'")
 
     if engine == "polars":
-        candidates_pl, num_b1, num_b2, pl = prepare_candidates_polars(
+        stats = core_pipeline_polars(
             input_path=input_path,
             col_name_1=col_name_1,
             col_name_2=col_name_2,
-        )
-        candidates_pl = compute_similarity_and_classify_polars(
-            candidates_pl,
-            alpha=alpha,
+            output_path=output_path,
             high_thr=high_thr,
             low_thr=low_thr,
-            pl=pl,
+            alpha=alpha,
         )
-        candidates_pl = candidates_pl.with_columns(
-            [
-                pl.col("sim_tokens_1").list.join(" ").alias("sim_tokens_1"),
-                pl.col("sim_tokens_2").list.join(" ").alias("sim_tokens_2"),
-            ]
-        )
-        candidates_pl = candidates_pl.sort("sim_final", descending=True)
-        candidates_pl.write_csv(output_path)
-
-        num_match = (candidates_pl["match_label"] == "MATCH").sum()
-        num_review = (candidates_pl["match_label"] == "REVIEW").sum()
-        num_non_match = (candidates_pl["match_label"] == "NON_MATCH").sum()
-        num_candidates = len(candidates_pl)
-        num_block_keys = candidates_pl.select(pl.col("block_key").n_unique()).item()
     else:
-        df = pd.read_csv(input_path)
-        df_b1 = prepare_blocking_dataframe(df, col_name_1, "col1")
-        df_b2 = prepare_blocking_dataframe(df, col_name_2, "col2")
-        num_b1, num_b2 = len(df_b1), len(df_b2)
-        candidates = build_candidate_pairs(df_b1, df_b2)
-
-        candidates = compute_similarity_df(candidates, alpha=alpha)
-        candidates = classify_matches(candidates, high_thr=high_thr, low_thr=low_thr)
-
-        candidates.sort_values("sim_final", ascending=False, inplace=True)
-        candidates.to_csv(output_path, index=False)
-
-        num_match = (candidates["match_label"] == "MATCH").sum()
-        num_review = (candidates["match_label"] == "REVIEW").sum()
-        num_non_match = (candidates["match_label"] == "NON_MATCH").sum()
-        num_candidates = len(candidates)
-        num_block_keys = candidates["block_key"].nunique()
+        stats = core_pipeline_pandas(
+            input_path=input_path,
+            col_name_1=col_name_1,
+            col_name_2=col_name_2,
+            output_path=output_path,
+            high_thr=high_thr,
+            low_thr=low_thr,
+            alpha=alpha,
+        )
 
     print("Done.")
-    print(f"Records col1       : {num_b1}")
-    print(f"Records col2       : {num_b2}")
-    print(f"Candidate pairs    : {num_candidates}")
-    print(f"Block keys         : {num_block_keys}")
-    print(f"MATCH              : {num_match}")
-    print(f"REVIEW             : {num_review}")
-    print(f"NON_MATCH          : {num_non_match}")
+    print(f"Records col1       : {stats['num_b1']}")
+    print(f"Records col2       : {stats['num_b2']}")
+    print(f"Candidate pairs    : {stats['num_candidates']}")
+    print(f"Block keys         : {stats['num_block_keys']}")
+    print(f"MATCH              : {stats['num_match']}")
+    print(f"REVIEW             : {stats['num_review']}")
+    print(f"NON_MATCH          : {stats['num_non_match']}")
     print(f"Output saved to    : {output_path}")
 
 
