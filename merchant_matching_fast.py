@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List
+from typing import Any, List
 
 import numpy as np
 import pandas as pd
@@ -120,7 +120,7 @@ def _strip_type_prefix(tokens: List[str], mtype: MerchantType) -> List[str]:
     def strip_sequence(seq: List[str]) -> List[str]:
         nonlocal t
         if _has_sequence(t, seq):
-            n, m = len(t, seq)
+            n, m = len(t), len(seq)
             for i in range(n - m + 1):
                 if t[i:i + m] == seq:
                     t = t[i + m:]
@@ -224,17 +224,6 @@ def extract_core(tokens: List[str], mtype: MerchantType) -> str:
     return filtered[0] if filtered else ""
 
 
-@dataclass
-class ParsedMerchant:
-    raw_name: str
-    normalized: str
-    tokens: List[str]
-    mtype: MerchantType
-    core: str
-    suffix_tokens: List[str]
-    location_key: str
-
-
 def parse_merchant(name: str) -> ParsedMerchant:
     normalized = normalize_name(name)
     tokens = tokenize(normalized)
@@ -291,6 +280,35 @@ def prepare_blocking_dataframe(df: pd.DataFrame, col_name: str, source_label: st
     return pd.DataFrame(records)
 
 
+def prepare_blocking_polars(
+    df: Any,
+    col_name: str,
+    source_label: str,
+    suffix: str,
+    pl: Any,
+) -> Any:
+    """Build blocking frame using Polars; keeps suffixes aligned with pandas output."""
+    values = df[col_name].to_list()
+    records = []
+    for idx, raw in enumerate(values):
+        parsed = parse_merchant(raw)
+        records.append(
+            {
+                "block_key": build_block_key(parsed),
+                f"source{suffix}": source_label,
+                f"row_id{suffix}": idx,
+                f"raw_name{suffix}": parsed.raw_name,
+                f"normalized{suffix}": parsed.normalized,
+                f"merchant_type{suffix}": parsed.mtype.value,
+                f"core{suffix}": parsed.core,
+                f"suffix{suffix}": " ".join(parsed.suffix_tokens),
+                f"location_key{suffix}": parsed.location_key,
+                f"sim_tokens{suffix}": get_similarity_tokens(parsed),
+            }
+        )
+    return pl.DataFrame(records)
+
+
 def build_candidate_pairs(df_block_1: pd.DataFrame, df_block_2: pd.DataFrame) -> pd.DataFrame:
     candidates = df_block_1.merge(
         df_block_2,
@@ -302,6 +320,16 @@ def build_candidate_pairs(df_block_1: pd.DataFrame, df_block_2: pd.DataFrame) ->
     loc2 = candidates["location_key_2"].fillna("")
     mask = (loc1 == "") | (loc2 == "") | (loc1 == loc2)
     return candidates[mask].reset_index(drop=True)
+
+
+def build_candidate_pairs_polars(df_block_1: Any, df_block_2: Any, pl: Any) -> Any:
+    """Join on block_key and filter by location using Polars expressions."""
+    candidates = df_block_1.join(df_block_2, on="block_key", how="inner")
+    return candidates.filter(
+        (pl.col("location_key_1") == "")
+        | (pl.col("location_key_2") == "")
+        | (pl.col("location_key_1") == pl.col("location_key_2"))
+    )
 
 
 def jaccard_similarity(tokens1: List[str], tokens2: List[str]) -> float:
@@ -396,6 +424,81 @@ def classify_matches(candidates: pd.DataFrame, high_thr: float = 0.75, low_thr: 
     return cand
 
 
+def compute_similarity_and_classify_polars(
+    candidates: Any,
+    alpha: float,
+    high_thr: float,
+    low_thr: float,
+    pl: Any,
+) -> Any:
+    """Compute similarities + labels with Polars set ops + RapidFuzz Levenshtein."""
+    try:
+        from rapidfuzz.distance import Levenshtein as rf_lev
+    except ImportError as exc:
+        raise ImportError(
+            "Polars engine needs rapidfuzz for Levenshtein. Please install rapidfuzz."
+        ) from exc
+
+    base = candidates.with_columns(
+        [
+            pl.col("sim_tokens_1").list.join(" ").alias("sim_name_1"),
+            pl.col("sim_tokens_2").list.join(" ").alias("sim_name_2"),
+        ]
+    )
+
+    inter_len = pl.col("sim_tokens_1").list.set_intersection(pl.col("sim_tokens_2")).list.len()
+    union_len = pl.col("sim_tokens_1").list.set_union(pl.col("sim_tokens_2")).list.len()
+    sim_jaccard = pl.when(union_len == 0).then(1.0).otherwise(inter_len / union_len)
+
+    sim_lev = pl.struct(["sim_name_1", "sim_name_2"]).map_elements(
+        lambda row: rf_lev.normalized_similarity(row["sim_name_1"], row["sim_name_2"]) / 100.0
+    )
+
+    sim_final = alpha * sim_jaccard + (1.0 - alpha) * sim_lev
+
+    suf1 = pl.col("suffix_1").fill_null("").str.extract(r"(\d+)", 1)
+    suf2 = pl.col("suffix_2").fill_null("").str.extract(r"(\d+)", 1)
+    both_have = suf1.is_not_null() & suf2.is_not_null()
+    diff_branch = both_have & (suf1 != suf2)
+
+    match_label = (
+        pl.when(sim_final < low_thr)
+        .then(pl.lit("NON_MATCH"))
+        .when((sim_final >= high_thr) & (~diff_branch))
+        .then(pl.lit("MATCH"))
+        .otherwise(pl.lit("REVIEW"))
+    )
+
+    return base.with_columns(
+        [
+            sim_jaccard.alias("sim_jaccard"),
+            sim_lev.alias("sim_levenshtein"),
+            sim_final.alias("sim_final"),
+            match_label.alias("match_label"),
+        ]
+    )
+
+
+def prepare_candidates_polars(
+    input_path: str,
+    col_name_1: str,
+    col_name_2: str,
+) -> tuple[Any, int, int, Any]:
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise ImportError(
+            "Polars engine requested but polars is not installed. Please install polars."
+        ) from exc
+
+    df = pl.read_csv(input_path)
+    df_b1 = prepare_blocking_polars(df, col_name_1, "col1", "_1", pl)
+    df_b2 = prepare_blocking_polars(df, col_name_2, "col2", "_2", pl)
+
+    candidates = build_candidate_pairs_polars(df_b1, df_b2, pl)
+    return candidates, len(df_b1), len(df_b2), pl
+
+
 def run_matching(
     input_path: str,
     col_name_1: str = "Merchant_Name_1",
@@ -404,28 +507,63 @@ def run_matching(
     high_thr: float = 0.75,
     low_thr: float = 0.4,
     alpha: float = 0.5,
+    engine: str = "pandas",
 ) -> None:
-    df = pd.read_csv(input_path)
+    engine = engine.lower()
+    if engine not in {"pandas", "polars"}:
+        raise ValueError("engine must be 'pandas' or 'polars'")
 
-    df_b1 = prepare_blocking_dataframe(df, col_name_1, "col1")
-    df_b2 = prepare_blocking_dataframe(df, col_name_2, "col2")
+    if engine == "polars":
+        candidates_pl, num_b1, num_b2, pl = prepare_candidates_polars(
+            input_path=input_path,
+            col_name_1=col_name_1,
+            col_name_2=col_name_2,
+        )
+        candidates_pl = compute_similarity_and_classify_polars(
+            candidates_pl,
+            alpha=alpha,
+            high_thr=high_thr,
+            low_thr=low_thr,
+            pl=pl,
+        )
+        candidates_pl = candidates_pl.with_columns(
+            [
+                pl.col("sim_tokens_1").list.join(" ").alias("sim_tokens_1"),
+                pl.col("sim_tokens_2").list.join(" ").alias("sim_tokens_2"),
+            ]
+        )
+        candidates_pl = candidates_pl.sort("sim_final", descending=True)
+        candidates_pl.write_csv(output_path)
 
-    candidates = build_candidate_pairs(df_b1, df_b2)
-    candidates = compute_similarity_df(candidates, alpha=alpha)
-    candidates = classify_matches(candidates, high_thr=high_thr, low_thr=low_thr)
+        num_match = (candidates_pl["match_label"] == "MATCH").sum()
+        num_review = (candidates_pl["match_label"] == "REVIEW").sum()
+        num_non_match = (candidates_pl["match_label"] == "NON_MATCH").sum()
+        num_candidates = len(candidates_pl)
+        num_block_keys = candidates_pl.select(pl.col("block_key").n_unique()).item()
+    else:
+        df = pd.read_csv(input_path)
+        df_b1 = prepare_blocking_dataframe(df, col_name_1, "col1")
+        df_b2 = prepare_blocking_dataframe(df, col_name_2, "col2")
+        num_b1, num_b2 = len(df_b1), len(df_b2)
+        candidates = build_candidate_pairs(df_b1, df_b2)
 
-    candidates.sort_values("sim_final", ascending=False, inplace=True)
-    candidates.to_csv(output_path, index=False)
+        candidates = compute_similarity_df(candidates, alpha=alpha)
+        candidates = classify_matches(candidates, high_thr=high_thr, low_thr=low_thr)
 
-    num_match = (candidates["match_label"] == "MATCH").sum()
-    num_review = (candidates["match_label"] == "REVIEW").sum()
-    num_non_match = (candidates["match_label"] == "NON_MATCH").sum()
+        candidates.sort_values("sim_final", ascending=False, inplace=True)
+        candidates.to_csv(output_path, index=False)
+
+        num_match = (candidates["match_label"] == "MATCH").sum()
+        num_review = (candidates["match_label"] == "REVIEW").sum()
+        num_non_match = (candidates["match_label"] == "NON_MATCH").sum()
+        num_candidates = len(candidates)
+        num_block_keys = candidates["block_key"].nunique()
 
     print("Done.")
-    print(f"Records col1       : {len(df_b1)}")
-    print(f"Records col2       : {len(df_b2)}")
-    print(f"Candidate pairs    : {len(candidates)}")
-    print(f"Block keys         : {candidates['block_key'].nunique()}")
+    print(f"Records col1       : {num_b1}")
+    print(f"Records col2       : {num_b2}")
+    print(f"Candidate pairs    : {num_candidates}")
+    print(f"Block keys         : {num_block_keys}")
     print(f"MATCH              : {num_match}")
     print(f"REVIEW             : {num_review}")
     print(f"NON_MATCH          : {num_non_match}")
@@ -443,6 +581,12 @@ if __name__ == "__main__":
     parser.add_argument("--high_thr", type=float, default=0.75, help="High threshold for MATCH.")
     parser.add_argument("--low_thr", type=float, default=0.4, help="Low threshold for REVIEW.")
     parser.add_argument("--alpha", type=float, default=0.5, help="Weight for Jaccard vs Levenshtein.")
+    parser.add_argument(
+        "--engine",
+        choices=["pandas", "polars"],
+        default="pandas",
+        help="Dataframe engine for blocking step.",
+    )
 
     args = parser.parse_args()
     run_matching(
@@ -453,4 +597,5 @@ if __name__ == "__main__":
         high_thr=args.high_thr,
         low_thr=args.low_thr,
         alpha=args.alpha,
+        engine=args.engine,
     )

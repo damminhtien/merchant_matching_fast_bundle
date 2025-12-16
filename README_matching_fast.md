@@ -50,11 +50,13 @@ python merchant_matching_fast.py \
     --output merchant_matching_results_fast.csv \
     --high_thr 0.75 \
     --low_thr 0.4 \
-    --alpha 0.5
+    --alpha 0.5 \
+    --engine pandas        # or polars (runs similarity/classification in Polars, no Python loops)
 ```
 
 - `alpha`: weight between Jaccard and Levenshtein.
 - `high_thr`, `low_thr`: thresholds for MATCH/REVIEW/NON_MATCH.
+- `engine`: dataframe engine for the blocking/join step (Polars path also runs similarity + classification with Polars set ops and RapidFuzz Levenshtein to avoid Python row loops).
 
 ## Performance optimizations
 
