@@ -52,6 +52,14 @@ python merchant_matching_fast.py \
 - Add more merchant types by appending to `TYPE_RULES` in `domain.py`.
 - Output CSV now includes metadata columns: `engine`, `alpha`, `high_thr`, `low_thr`, `timestamp`, `version`.
 
+### Max-speed tips
+
+- Use `--engine polars` to keep blocking and similarity/classification out of Python loops.
+- Keep `sim_tokens` small: add generic tokens to `config.py` to strip noisy words early.
+- For very large inputs on pandas, parallelize `compute_similarity_df` with `joblib`/`multiprocessing` (row-level work is pure Python but Levenshtein runs in C via RapidFuzz).
+- For distributed scale, port the parsing/blocking logic as Spark UDFs and keep the same block_key + location filter strategy before similarity.
+- Profile blocking cardinality: overly broad blocks explode candidate pairs; adjust rules or core extraction to keep blocks tight.
+
 ## Testing
 
 ```bash
